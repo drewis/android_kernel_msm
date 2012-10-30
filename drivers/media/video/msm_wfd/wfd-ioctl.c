@@ -248,7 +248,6 @@ int wfd_allocate_input_buffers(struct wfd_device *wfd_dev,
 	spin_unlock_irqrestore(&inst->inst_lock, flags);
 
 	for (i = 0; i < VENC_INPUT_BUFFERS; ++i) {
-		struct mem_region_map mmap_context = {0};
 		mpair = kzalloc(sizeof(*mpair), GFP_KERNEL);
 		enc_mregion = kzalloc(sizeof(*enc_mregion), GFP_KERNEL);
 		mdp_mregion = kzalloc(sizeof(*enc_mregion), GFP_KERNEL);
