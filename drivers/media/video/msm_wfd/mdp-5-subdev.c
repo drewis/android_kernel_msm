@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2011-2012, The Linux Foundation. All rights reserved.
 *
 * This program is free software; you can redistribute it and/or modify
 * it under the terms of the GNU General Public License version 2 and
@@ -10,53 +10,65 @@
 * GNU General Public License for more details.
 *
 */
+#include <linux/msm_mdp.h>
+#include <mach/iommu_domains.h>
+#include <media/videobuf2-core.h>
+#include "enc-subdev.h"
 #include "mdp-subdev.h"
 #include "wfd-util.h"
-#include <media/videobuf2-core.h>
-#include <linux/msm_mdp.h>
+#include <linux/switch.h>
 
 struct mdp_instance {
 	struct fb_info *mdp;
 	u32 height;
 	u32 width;
+	bool secure;
+	struct switch_dev sdev;
 };
 
 int mdp_init(struct v4l2_subdev *sd, u32 val)
 {
 	return 0;
 }
+
 int mdp_open(struct v4l2_subdev *sd, void *arg)
 {
 	struct mdp_instance *inst = kzalloc(sizeof(struct mdp_instance),
 					GFP_KERNEL);
-	void **cookie = (void **)arg;
+	struct mdp_msg_ops *mops = arg;
 	int rc = 0;
 	struct fb_info *fbi = NULL;
 
 	if (!inst) {
 		WFD_MSG_ERR("Out of memory\n");
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto mdp_open_fail;
+	} else if (!mops) {
+		WFD_MSG_ERR("Invalid arguments\n");
+		rc = -EINVAL;
+		goto mdp_open_fail;
 	}
 
 	fbi = msm_fb_get_writeback_fb();
 	if (!fbi) {
 		WFD_MSG_ERR("Failed to acquire mdp instance\n");
 		rc = -ENODEV;
-		goto exit;
+		goto mdp_open_fail;
 	}
-
-	/*Tell HDMI daemon to open fb2*/
-	rc = kobject_uevent(&fbi->dev->kobj, KOBJ_ADD);
+	inst->sdev.name = "wfd";
+	/* Register wfd node to switch driver */
+	rc = switch_dev_register(&inst->sdev);
 	if (rc) {
-		WFD_MSG_ERR("Failed add to kobj");
-		goto exit;
+		WFD_MSG_ERR("WFD switch registration failed\n");
+		goto mdp_open_fail;
 	}
-
 	msm_fb_writeback_init(fbi);
 	inst->mdp = fbi;
-	*cookie = inst;
+	inst->secure = mops->secure;
+
+	mops->cookie = inst;
 	return rc;
-exit:
+mdp_open_fail:
 	kfree(inst);
 	return rc;
 }
@@ -78,13 +90,13 @@ int mdp_start(struct v4l2_subdev *sd, void *arg)
 			rc = -ENODEV;
 			goto exit;
 		}
-		rc = kobject_uevent(&fbi->dev->kobj, KOBJ_ONLINE);
-		if (rc)
-			WFD_MSG_ERR("Failed to send ONLINE event\n");
+		switch_set_state(&inst->sdev, true);
+		WFD_MSG_DBG("wfd state switched to %d\n", inst->sdev.state);
 	}
 exit:
 	return rc;
 }
+
 int mdp_stop(struct v4l2_subdev *sd, void *arg)
 {
 	struct mdp_instance *inst = arg;
@@ -97,11 +109,8 @@ int mdp_stop(struct v4l2_subdev *sd, void *arg)
 			return rc;
 		}
 		fbi = (struct fb_info *)inst->mdp;
-		rc = kobject_uevent(&fbi->dev->kobj, KOBJ_OFFLINE);
-		if (rc) {
-			WFD_MSG_ERR("Failed to send offline event\n");
-			return -EIO;
-		}
+		switch_set_state(&inst->sdev, false);
+		WFD_MSG_DBG("wfd state switched to %d\n", inst->sdev.state);
 	}
 	return 0;
 }
@@ -113,6 +122,8 @@ int mdp_close(struct v4l2_subdev *sd, void *arg)
 		fbi = (struct fb_info *)inst->mdp;
 		msm_fb_writeback_terminate(fbi);
 		kfree(inst);
+		/* Unregister wfd node from switch driver */
+		switch_dev_unregister(&inst->sdev);
 	}
 	return 0;
 }
@@ -134,8 +145,8 @@ int mdp_q_buffer(struct v4l2_subdev *sd, void *arg)
 	fbdata.flags = 0;
 	fbdata.priv = (uint32_t)binfo->cookie;
 
-	WFD_MSG_INFO("queue buffer to mdp with offset = %u,"
-			"fd = %u, priv = %p, iova = %p\n",
+	WFD_MSG_DBG("queue buffer to mdp with offset = %u, fd = %u, "\
+			"priv = %p, iova = %p\n",
 			fbdata.offset, fbdata.memory_id,
 			(void *)fbdata.priv, (void *)fbdata.iova);
 	rc = msm_fb_writeback_queue_buffer(inst->mdp, &fbdata);
@@ -179,6 +190,58 @@ int mdp_set_prop(struct v4l2_subdev *sd, void *arg)
 	inst->width = prop->width;
 	return 0;
 }
+
+int mdp_mmap(struct v4l2_subdev *sd, void *arg)
+{
+	int rc = 0;
+	struct mem_region_map *mmap = arg;
+	struct mem_region *mregion;
+	bool domain = -1;
+	struct mdp_instance *inst = NULL;
+
+	if (!mmap || !mmap->mregion || !mmap->cookie) {
+		WFD_MSG_ERR("Invalid argument\n");
+		return -EINVAL;
+	}
+
+	inst = mmap->cookie;
+	mregion = mmap->mregion;
+	if (mregion->size % SZ_4K != 0) {
+		WFD_MSG_ERR("Memregion not aligned to %d\n", SZ_4K);
+		return -EINVAL;
+	}
+
+	domain = msm_fb_get_iommu_domain();
+	rc = ion_map_iommu(mmap->ion_client, mregion->ion_handle,
+			domain, 0, SZ_4K, 0,
+			(unsigned long *)&mregion->paddr,
+			(unsigned long *)&mregion->size,
+			0, 0);
+	return rc;
+}
+
+int mdp_munmap(struct v4l2_subdev *sd, void *arg)
+{
+	struct mem_region_map *mmap = arg;
+	struct mem_region *mregion;
+	bool domain = -1;
+	struct mdp_instance *inst = NULL;
+
+	if (!mmap || !mmap->mregion || !mmap->cookie) {
+		WFD_MSG_ERR("Invalid argument\n");
+		return -EINVAL;
+	}
+
+	inst = mmap->cookie;
+	mregion = mmap->mregion;
+
+	domain = msm_fb_get_iommu_domain();
+	ion_unmap_iommu(mmap->ion_client,
+			mregion->ion_handle,
+			domain, 0);
+	return 0;
+}
+
 long mdp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 {
 	int rc = 0;
@@ -207,6 +270,12 @@ long mdp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 		break;
 	case MDP_CLOSE:
 		rc = mdp_close(sd, arg);
+		break;
+	case MDP_MMAP:
+		rc = mdp_mmap(sd, arg);
+		break;
+	case MDP_MUNMAP:
+		rc = mdp_munmap(sd, arg);
 		break;
 	default:
 		WFD_MSG_ERR("IOCTL: %u not supported\n", cmd);
