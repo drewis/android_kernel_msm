@@ -53,24 +53,12 @@
  * SAMPLING_PERIODS * MIN_SAMPLING_RATE is the minimum
  * load history which will be averaged
  */
-#define SAMPLING_PERIODS	10
+#define SAMPLING_PERIODS	12
 #define INDEX_MAX_VALUE		(SAMPLING_PERIODS - 1)
 /*
  * MIN_SAMPLING_RATE is scaled based on num_online_cpus()
  */
 #define MIN_SAMPLING_RATE	msecs_to_jiffies(20)
-
-/*
- * Load defines:
- * ENABLE_ALL is a high watermark to rapidly online all CPUs
- *
- * ENABLE is the load which is required to enable 1 extra CPU
- * DISABLE is the load at which a CPU is disabled
- * These two are scaled based on num_online_cpus()
- */
-#define ENABLE_ALL_LOAD_THRESHOLD	(125 * CPUS_AVAILABLE)
-#define ENABLE_LOAD_THRESHOLD		225
-#define DISABLE_LOAD_THRESHOLD		60
 
 /* Control flags */
 unsigned char flags;
@@ -78,6 +66,24 @@ unsigned char flags;
 #define HOTPLUG_PAUSED		(1 << 1)
 #define BOOSTPULSE_ACTIVE	(1 << 2)
 #define EARLYSUSPEND_ACTIVE	(1 << 3)
+
+#define AUTO_HOTPLUG_MODULE_PARM(n,v) \
+	static unsigned int n = v; \
+	module_param(n, int, 0664);
+/*
+ * Load defines:
+ * ENABLE_ALL is a high watermark to rapidly online all CPUs
+ * DISABLE_ALL is target load to reduce from 2 online CPUs to 1
+ *     this value should be between ENABLE and ENABLE*2
+ *
+ * ENABLE is the load which is required to enable 1 extra CPU
+ * DISABLE is the load at which a CPU is disabled
+ * These two are scaled based on num_online_cpus()
+ */
+AUTO_HOTPLUG_MODULE_PARM(enable_all_load_threshold, 700);
+AUTO_HOTPLUG_MODULE_PARM(enable_load_threshold, 225);
+AUTO_HOTPLUG_MODULE_PARM(disable_all_load_threshold, 95);
+AUTO_HOTPLUG_MODULE_PARM(disable_load_threshold, 60);
 
 struct delayed_work hotplug_decision_work;
 struct delayed_work hotplug_unpause_work;
@@ -100,8 +106,8 @@ static void hotplug_decision_work_fn(struct work_struct *work)
 
 	online_cpus = num_online_cpus();
 	available_cpus = CPUS_AVAILABLE;
-	disable_load = DISABLE_LOAD_THRESHOLD * online_cpus;
-	enable_load = ENABLE_LOAD_THRESHOLD * online_cpus;
+	disable_load = disable_load_threshold * online_cpus;
+	enable_load = enable_load_threshold * online_cpus;
 	/*
 	 * Multiply nr_running() by 100 so we don't have to
 	 * use fp division to get the average.
@@ -153,7 +159,7 @@ static void hotplug_decision_work_fn(struct work_struct *work)
 #endif
 
 	if (likely(!(flags & HOTPLUG_DISABLED))) {
-		if (unlikely((avg_running >= ENABLE_ALL_LOAD_THRESHOLD) && (online_cpus < available_cpus))) {
+		if (unlikely((avg_running >= enable_all_load_threshold) && (online_cpus < available_cpus))) {
 			pr_info("auto_hotplug: Onlining all CPUs, avg running: %d\n", avg_running);
 			/*
 			 * Flush any delayed offlining work from the workqueue.
@@ -180,8 +186,17 @@ static void hotplug_decision_work_fn(struct work_struct *work)
 		} else if (avg_running <= disable_load) {
 			/* Only queue a cpu_down() if there isn't one already pending */
 			if (!(delayed_work_pending(&hotplug_offline_work))) {
-				pr_info("auto_hotplug: Offlining CPU, avg running: %d\n", avg_running);
-				schedule_delayed_work_on(0, &hotplug_offline_work, HZ);
+				if (online_cpus > 2) {
+					pr_info("auto_hotplug: Offlining CPU, avg running: %d\n",
+						  avg_running);
+					schedule_delayed_work_on(0, &hotplug_offline_work, HZ);
+				/* favor keeping 2 cores online */
+				} else if (online_cpus > 1 &&
+					(avg_running <= disable_all_load_threshold)) {
+					pr_info("auto_hotplug: Offlining CPU, avg running: %d\n",
+						  avg_running);
+					schedule_delayed_work_on(0, &hotplug_offline_work, HZ);
+				}
 			}
 			/* If boostpulse is active, clear the flags */
 			if (flags & BOOSTPULSE_ACTIVE) {
@@ -333,6 +348,7 @@ static void auto_hotplug_late_resume(struct early_suspend *handler)
 	pr_info("auto_hotplug: late resume handler\n");
 	flags &= ~EARLYSUSPEND_ACTIVE;
 
+	schedule_work(&hotplug_online_single_work);
 	schedule_delayed_work_on(0, &hotplug_decision_work, HZ);
 }
 
