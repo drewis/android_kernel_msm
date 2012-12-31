@@ -361,9 +361,15 @@ static DECLARE_WORK(smsm_cb_work, notify_smsm_cb_clients_worker);
 static DEFINE_MUTEX(smsm_lock);
 static struct smsm_state_info *smsm_states;
 static int spinlocks_initialized;
-static RAW_NOTIFIER_HEAD(smsm_driver_state_notifier_list);
-static DEFINE_MUTEX(smsm_driver_state_notifier_lock);
-static void smsm_driver_state_notify(uint32_t state, void *data);
+
+/**
+ * Variables to indicate smd module initialization.
+ * Dependents to register for smd module init notifier.
+ */
+static int smd_module_inited;
+static RAW_NOTIFIER_HEAD(smd_module_init_notifier_list);
+static DEFINE_MUTEX(smd_module_init_notifier_lock);
+static void smd_module_init_notify(uint32_t state, void *data);
 
 static inline void smd_write_intr(unsigned int val,
 				const void __iomem *addr)
@@ -796,17 +802,21 @@ static void smd_channel_probe_worker(struct work_struct *work)
  * @pid:       Processor ID of processor on edge
  * @local_ch:  Channel that belongs to processor @pid
  * @remote_ch: Other side of edge contained @pid
+ * @is_word_access_ch: Bool, is this a word aligned access channel
  *
  * Returns 0 for not on edge, 1 for found on edge
  */
-static int pid_is_on_edge(struct smd_shared_v2 *shared2,
+static int pid_is_on_edge(void *shared2,
 		uint32_t type, uint32_t pid,
-		struct smd_half_channel **local_ch,
-		struct smd_half_channel **remote_ch
+		void **local_ch,
+		void **remote_ch,
+		int is_word_access_ch
 		)
 {
 	int ret = 0;
 	struct edge_to_pid *edge;
+	void *ch0;
+	void *ch1;
 
 	*local_ch = 0;
 	*remote_ch = 0;
@@ -814,15 +824,23 @@ static int pid_is_on_edge(struct smd_shared_v2 *shared2,
 	if (!shared2 || (type >= ARRAY_SIZE(edge_to_pids)))
 		return 0;
 
+	if (is_word_access_ch) {
+		ch0 = &((struct smd_shared_v2_word_access *)(shared2))->ch0;
+		ch1 = &((struct smd_shared_v2_word_access *)(shared2))->ch1;
+	} else {
+		ch0 = &((struct smd_shared_v2 *)(shared2))->ch0;
+		ch1 = &((struct smd_shared_v2 *)(shared2))->ch1;
+	}
+
 	edge = &edge_to_pids[type];
 	if (edge->local_pid != edge->remote_pid) {
 		if (pid == edge->local_pid) {
-			*local_ch = &shared2->ch0;
-			*remote_ch = &shared2->ch1;
+			*local_ch = ch0;
+			*remote_ch = ch1;
 			ret = 1;
 		} else if (pid == edge->remote_pid) {
-			*local_ch = &shared2->ch1;
-			*remote_ch = &shared2->ch0;
+			*local_ch = ch1;
+			*remote_ch = ch0;
 			ret = 1;
 		}
 	}
@@ -874,14 +892,29 @@ const char *smd_pid_to_subsystem(uint32_t pid)
 }
 EXPORT_SYMBOL(smd_pid_to_subsystem);
 
-static void smd_reset_edge(struct smd_half_channel *ch, unsigned new_state)
+static void smd_reset_edge(void *void_ch, unsigned new_state,
+				int is_word_access_ch)
 {
-	if (ch->state != SMD_SS_CLOSED) {
-		ch->state = new_state;
-		ch->fDSR = 0;
-		ch->fCTS = 0;
-		ch->fCD = 0;
-		ch->fSTATE = 1;
+	if (is_word_access_ch) {
+		struct smd_half_channel_word_access *ch =
+			(struct smd_half_channel_word_access *)(void_ch);
+		if (ch->state != SMD_SS_CLOSED) {
+			ch->state = new_state;
+			ch->fDSR = 0;
+			ch->fCTS = 0;
+			ch->fCD = 0;
+			ch->fSTATE = 1;
+		}
+	} else {
+		struct smd_half_channel *ch =
+			(struct smd_half_channel *)(void_ch);
+		if (ch->state != SMD_SS_CLOSED) {
+			ch->state = new_state;
+			ch->fDSR = 0;
+			ch->fCTS = 0;
+			ch->fCD = 0;
+			ch->fSTATE = 1;
+		}
 	}
 }
 
@@ -889,10 +922,11 @@ static void smd_channel_reset_state(struct smd_alloc_elm *shared,
 		unsigned new_state, unsigned pid)
 {
 	unsigned n;
-	struct smd_shared_v2 *shared2;
+	void *shared2;
 	uint32_t type;
-	struct smd_half_channel *local_ch;
-	struct smd_half_channel *remote_ch;
+	void *local_ch;
+	void *remote_ch;
+	int is_word_access;
 
 	for (n = 0; n < SMD_CHANNELS; n++) {
 		if (!shared[n].ref_count)
@@ -901,12 +935,19 @@ static void smd_channel_reset_state(struct smd_alloc_elm *shared,
 			continue;
 
 		type = SMD_CHANNEL_TYPE(shared[n].type);
-		shared2 = smem_alloc(SMEM_SMD_BASE_ID + n, sizeof(*shared2));
+		is_word_access = is_word_access_ch(type);
+		if (is_word_access)
+			shared2 = smem_alloc(SMEM_SMD_BASE_ID + n,
+				sizeof(struct smd_shared_v2_word_access));
+		else
+			shared2 = smem_alloc(SMEM_SMD_BASE_ID + n,
+				sizeof(struct smd_shared_v2));
 		if (!shared2)
 			continue;
 
-		if (pid_is_on_edge(shared2, type, pid, &local_ch, &remote_ch))
-			smd_reset_edge(local_ch, new_state);
+		if (pid_is_on_edge(shared2, type, pid, &local_ch, &remote_ch,
+							is_word_access))
+			smd_reset_edge(local_ch, new_state, is_word_access);
 
 		/*
 		 * ModemFW is in the same subsystem as ModemSW, but has
@@ -914,8 +955,8 @@ static void smd_channel_reset_state(struct smd_alloc_elm *shared,
 		 */
 		if (pid == SMSM_MODEM &&
 				pid_is_on_edge(shared2, type, SMD_MODEM_Q6_FW,
-				 &local_ch, &remote_ch))
-			smd_reset_edge(local_ch, new_state);
+				 &local_ch, &remote_ch, is_word_access))
+			smd_reset_edge(local_ch, new_state, is_word_access);
 	}
 }
 
@@ -926,15 +967,16 @@ void smd_channel_reset(uint32_t restart_pid)
 	unsigned long flags;
 
 	SMD_DBG("%s: starting reset\n", __func__);
+
+	/* release any held spinlocks */
+	remote_spin_release(&remote_spinlock, restart_pid);
+	remote_spin_release_all(restart_pid);
+
 	shared = smem_find(ID_CH_ALLOC_TBL, sizeof(*shared) * 64);
 	if (!shared) {
 		pr_err("%s: allocation table not initialized\n", __func__);
 		return;
 	}
-
-	/* release any held spinlocks */
-	remote_spin_release(&remote_spinlock, restart_pid);
-	remote_spin_release_all(restart_pid);
 
 	/* reset SMSM entry */
 	if (smsm_info.state) {
@@ -2465,13 +2507,6 @@ static int smsm_init(void)
 	int i;
 	struct smsm_size_info_type *smsm_size_info;
 
-	i = remote_spin_lock_init(&remote_spinlock, SMEM_SPINLOCK_SMEM_ALLOC);
-	if (i) {
-		pr_err("%s: remote spinlock init failed %d\n", __func__, i);
-		return i;
-	}
-	spinlocks_initialized = 1;
-
 	smsm_size_info = smem_alloc(SMEM_SMSM_SIZE_INFO,
 				sizeof(struct smsm_size_info_type));
 	if (smsm_size_info) {
@@ -2530,7 +2565,6 @@ static int smsm_init(void)
 		return i;
 
 	wmb();
-	smsm_driver_state_notify(SMSM_INIT, NULL);
 	return 0;
 }
 
@@ -3104,37 +3138,40 @@ int smsm_state_cb_deregister(uint32_t smsm_entry, uint32_t mask,
 }
 EXPORT_SYMBOL(smsm_state_cb_deregister);
 
-int smsm_driver_state_notifier_register(struct notifier_block *nb)
+int smd_module_init_notifier_register(struct notifier_block *nb)
 {
 	int ret;
 	if (!nb)
 		return -EINVAL;
-	mutex_lock(&smsm_driver_state_notifier_lock);
-	ret = raw_notifier_chain_register(&smsm_driver_state_notifier_list, nb);
-	mutex_unlock(&smsm_driver_state_notifier_lock);
+	mutex_lock(&smd_module_init_notifier_lock);
+	ret = raw_notifier_chain_register(&smd_module_init_notifier_list, nb);
+	if (smd_module_inited)
+		nb->notifier_call(nb, 0, NULL);
+	mutex_unlock(&smd_module_init_notifier_lock);
 	return ret;
 }
-EXPORT_SYMBOL(smsm_driver_state_notifier_register);
+EXPORT_SYMBOL(smd_module_init_notifier_register);
 
-int smsm_driver_state_notifier_unregister(struct notifier_block *nb)
+int smd_module_init_notifier_unregister(struct notifier_block *nb)
 {
 	int ret;
 	if (!nb)
 		return -EINVAL;
-	mutex_lock(&smsm_driver_state_notifier_lock);
-	ret = raw_notifier_chain_unregister(&smsm_driver_state_notifier_list,
+	mutex_lock(&smd_module_init_notifier_lock);
+	ret = raw_notifier_chain_unregister(&smd_module_init_notifier_list,
 					    nb);
-	mutex_unlock(&smsm_driver_state_notifier_lock);
+	mutex_unlock(&smd_module_init_notifier_lock);
 	return ret;
 }
-EXPORT_SYMBOL(smsm_driver_state_notifier_unregister);
+EXPORT_SYMBOL(smd_module_init_notifier_unregister);
 
-static void smsm_driver_state_notify(uint32_t state, void *data)
+static void smd_module_init_notify(uint32_t state, void *data)
 {
-	mutex_lock(&smsm_driver_state_notifier_lock);
-	raw_notifier_call_chain(&smsm_driver_state_notifier_list,
+	mutex_lock(&smd_module_init_notifier_lock);
+	smd_module_inited = 1;
+	raw_notifier_call_chain(&smd_module_init_notifier_list,
 				state, data);
-	mutex_unlock(&smsm_driver_state_notifier_lock);
+	mutex_unlock(&smd_module_init_notifier_lock);
 }
 
 int smd_core_init(void)
@@ -3547,12 +3584,29 @@ static struct platform_driver msm_smd_driver = {
 int __init msm_smd_init(void)
 {
 	static bool registered;
+	int rc;
 
 	if (registered)
 		return 0;
 
 	registered = true;
-	return platform_driver_register(&msm_smd_driver);
+	rc = remote_spin_lock_init(&remote_spinlock, SMEM_SPINLOCK_SMEM_ALLOC);
+	if (rc) {
+		pr_err("%s: remote spinlock init failed %d\n", __func__, rc);
+		return rc;
+	}
+	spinlocks_initialized = 1;
+
+	rc = platform_driver_register(&msm_smd_driver);
+	if (rc) {
+		pr_err("%s: msm_smd_driver register failed %d\n",
+			__func__, rc);
+		return rc;
+	}
+
+	smd_module_init_notify(0, NULL);
+
+	return 0;
 }
 
 module_init(msm_smd_init);
